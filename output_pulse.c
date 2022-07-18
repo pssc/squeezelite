@@ -29,6 +29,7 @@
 #if PULSEAUDIO
 
 #include <pulse/pulseaudio.h>
+#include <sys/mman.h>
 #include <math.h>
 
 // To report timing information back to the LMS the latency information needs to be
@@ -73,6 +74,8 @@ extern struct outputstate output;
 extern struct buffer *outputbuf;
 
 #define OUTPUT_STATE_TIMER_INTERVAL_USEC   100000
+#define PULSE_BUFFER_SIZE_MS 3000
+#define PULSE_BUFFER_TARGET_MS 2250
 
 #define LOCK   mutex_lock(outputbuf->mutex)
 #define UNLOCK mutex_unlock(outputbuf->mutex)
@@ -120,6 +123,16 @@ static inline void pulse_connection_iterate(pulse_connection *conn) {
 
 static inline pa_context * pulse_connection_get_context(pulse_connection *conn) {
 	return conn->ctx;
+}
+
+#if PULSEAUDIO_TIMING > 0
+static inline uint32_t pulse_get_usec_to_frames(pa_usec_t usec) {
+	return (uint32_t)((usec * output.current_sample_rate) / PA_USEC_PER_SEC);
+}
+#endif
+
+static inline uint32_t pulse_frames_to_usec(uint32_t frames) {
+	return (uint32_t)((frames * PA_USEC_PER_SEC)/output.current_sample_rate);
 }
 
 static bool pulse_connection_init(pulse_connection *conn) {
@@ -201,7 +214,9 @@ static void pulse_stream_state_cb(pa_stream *stream, void *userdata) {
 }
 
 static void pulse_stream_success_noop_cb(pa_stream *s, int success, void *userdata) {
+	LOG_DEBUG("OK");
 }
+
 
 static bool pulse_stream_create(struct pulse *p) {
 	p->sample_spec.rate = output.current_sample_rate;
@@ -220,9 +235,11 @@ static bool pulse_stream_create(struct pulse *p) {
 	p->stream_readiness = readiness_unknown;
 	pa_stream_set_state_callback(p->stream, pulse_stream_state_cb, p);
 
+		//PA_STREAM_VARIABLE_RATE | PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_INTERPOLATE_TIMING,
+		//PA_STREAM_VARIABLE_RATE | PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_INTERPOLATE_TIMING | PA_STREAM_ADJUST_LATENCY,
 	if (pa_stream_connect_playback(p->stream, p->sink_name, (const pa_buffer_attr *)NULL,
 #if PULSEAUDIO_TIMING == 2
-		PA_STREAM_VARIABLE_RATE | PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_INTERPOLATE_TIMING,
+		PA_STREAM_VARIABLE_RATE | PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_ADJUST_LATENCY,
 #else
 		PA_STREAM_VARIABLE_RATE,
 #endif
@@ -241,9 +258,10 @@ static bool pulse_stream_create(struct pulse *p) {
 
 	if (ok) {
 		pa_buffer_attr attr = { 0, };
-		attr.maxlength = (uint32_t)(-1);
-		attr.tlength = (uint32_t)(-1);
-		attr.prebuf = (uint32_t)(-1);
+		// Max pre adjust in lms is 3000ms allow for some addional tweeking
+		attr.maxlength = BYTES_PER_FRAME * pulse_get_usec_to_frames(PULSE_BUFFER_SIZE_MS*1000u);
+		attr.tlength = BYTES_PER_FRAME * pulse_get_usec_to_frames(PULSE_BUFFER_TARGET_MS*1000u);
+		attr.prebuf = BYTES_PER_FRAME * pulse_get_usec_to_frames(PULSE_BUFFER_TARGET_MS*1000u);
 		attr.minreq = (uint32_t)(-1);
 		pa_operation *op = pa_stream_set_buffer_attr(p->stream, &attr, pulse_stream_success_noop_cb, NULL);
 		ok = pulse_operation_wait(&p->conn, op);
@@ -296,6 +314,158 @@ void list_devices(void) {
 	}
 
 	pulse_connection_destroy(&conn);
+}
+
+#if PULSEAUDIO_TIMING == 0
+#	define DECLARE_LATENCY(n)			(void)0
+#	define pulse_retrieve_latency(n,x)	true
+#	define pulse_get_latency(n)			0
+#	define pulse_device_frames			0
+#elif PULSEAUDIO_TIMING == 2
+#	define DECLARE_LATENCY(n)			pa_usec_t n
+	static inline bool pulse_retrieve_latency(pa_usec_t *usec, int *neg) {
+		return pa_stream_get_latency(pulse.stream, usec, neg) == 0;
+	}
+#endif
+
+
+char *output_buffer_state_char(void) {
+   char *c = "u";
+   switch (output.state) {
+    case OUTPUT_OFF:
+      c = "o";
+      break;
+    case OUTPUT_STOPPED:
+      c = "s";
+      break;
+    case OUTPUT_BUFFER:
+      c = "b";
+      break;
+    case OUTPUT_RUNNING:
+      c = "r";
+      break;
+    case OUTPUT_PAUSE_FRAMES:
+      c = "p";
+      break;
+    case OUTPUT_SKIP_FRAMES:
+      c = "s";
+      break;
+    case OUTPUT_START_AT:
+      c = "a";
+      break;
+    default:
+      break;
+   }
+   return c;
+}
+
+#define DEVICE_FRAME_INTERVAL_MS 900
+#define DEVICE_FRAME_INIT_INTERRVAL_MS 2500
+
+static uint32_t nextms = 0;
+static uint32_t skiped = 0;
+
+static uint32_t latency_max = 0;
+static uint32_t latency_min = 0;
+
+#define DEVICE_SKIP_AVERAGE_SIZE 15
+static int skiped_pos = 0;
+static int skiped_len = DEVICE_SKIP_AVERAGE_SIZE;
+static uint64_t skiped_sum = 0;
+static uint32_t skiped_avga[DEVICE_SKIP_AVERAGE_SIZE] = {0};
+
+#define DEVICE_FRAME_AVERAGE_SIZE 5
+static int latency_pos = 0;
+static int latency_len = DEVICE_FRAME_AVERAGE_SIZE;
+static uint64_t latency_sum = DEVICE_FRAME_AVERAGE_SIZE*PULSE_BUFFER_TARGET_MS*1000u;
+//static uint32_t latency_avga[DEVICE_FRAME_AVERAGE_SIZE] = {PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u};
+static uint32_t latency_avga[DEVICE_FRAME_AVERAGE_SIZE] = {PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u};
+//static uint32_t latency_avga[DEVICE_FRAME_AVERAGE_SIZE] = {PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u};
+//static uint32_t latency_avga[DEVICE_FRAME_AVERAGE_SIZE] = {PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u};
+//static uint32_t latency_avga[DEVICE_FRAME_AVERAGE_SIZE] = {PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u,PULSE_BUFFER_TARGET_MS*1000u};
+uint32_t uint32Avg(uint32_t *ptrArrNumbers,uint64_t *ptrSum, int *pos, int len, uint32_t nNum)
+{
+  //Subtract the oldest number from the prev sum, add the new number
+  *ptrSum = *ptrSum - ptrArrNumbers[*pos] + nNum;
+  //Assign the nextNum to the position in the array
+  ptrArrNumbers[*pos] = nNum;
+  //next pos
+  *pos = *pos < len-1 ? *pos+1 :0;
+  //return the average
+  return (uint32_t) (*ptrSum / len);
+}
+
+
+static inline void pulse_device_frames(uint32_t timems) {
+	DECLARE_LATENCY(latency_usec);
+	int neg;
+
+	if (output.state == OUTPUT_SKIP_FRAMES) {
+	   skiped += output.skip_frames;
+/*
+	   //skiped = skiped > 0 ? (output.skip_frames+skiped/2) : output.skip_frames;
+	   //skiped += output.skip_frames;
+           if (pulse_frames_to_usec(output.skip_frames) > 45000u) {
+		skiped += pulse_get_usec_to_frames(45000u);
+	   } else {
+	        skiped += pulse_get_usec_to_frames(1000u);
+	        skiped += output.skip_frames;
+	   }
+	   skiped /=2;
+	   LOG_DEBUG("PulseAudio skip %uf(%uus) skip total %uf(%ums)",(uint32_t)output.skip_frames,pulse_frames_to_usec(output.skip_frames),(uint32_t)  skiped ,pulse_frames_to_usec(skiped)/1000u);
+	   */
+	} else if (timems > nextms) {
+	   bool lok = pulse_retrieve_latency(&latency_usec, &neg);
+           uint32_t skiped_avg = uint32Avg(skiped_avga, &skiped_sum, &skiped_pos, skiped_len, pulse_frames_to_usec(skiped));
+	   skiped = 0;
+	   if (lok) {
+	      frames_t device_frames = pulse_get_usec_to_frames(latency_usec)+1u;
+	      uint32_t usec = pulse_frames_to_usec(output.device_frames);
+	      int udiff = (int) latency_usec-usec;
+              uint32_t latency_avg = uint32Avg(latency_avga, &latency_sum, &latency_pos, latency_len, latency_usec);
+
+	      if ( device_frames > 1 ) {
+/*
+		 uint32_t ti = (timems - (nextms - DEVICE_FRAME_INTERVAL_MS));
+                 //uint32_t tl = skiped / ti;
+                 uint32_t tl = (skiped > 0) ? skiped : (skiped/2) ;
+
+                 skiped_rolla = (skiped_rolla == 0 ) ? tl : (tl+skiped_rolla/2);
+		 if (tl > skiped_latch) {
+		    skiped_latch = tl;
+	            LOG_DEBUG("PulseAudio set sl %uf",(uint32_t)skiped_latch);
+		 } else {
+	            if (skiped > 0) {
+                       skiped_latch+= tl < ti ? skiped : tl;
+	               LOG_DEBUG("PulseAudio add sl %ufsl %ufis %ums",(uint32_t)skiped_latch,(uint32_t)tl,(uint32_t)ti);
+	            } else {
+		       if (output.state == OUTPUT_RUNNING) {
+		       //skiped_latch--;
+		       }
+		    }
+
+*/
+		 if ( latency_usec > latency_max) {
+                     LOG_INFO("Max %u -> %uus",(uint32_t)latency_max,(uint32_t)latency_usec);
+		     latency_max = latency_usec;
+	         } else if ( latency_usec < latency_min ) {
+                     LOG_INFO("Min %u -> %uus",(uint32_t)latency_min,(uint32_t)latency_usec);
+                     latency_min = latency_usec;
+		 }
+	         LOG_DEBUG("l %s%s%uσ%+4d mam%u/%u/%ums %u",output_buffer_state_char(), (neg==1 ? "-":"+") ,(uint32_t)usec/1000u,(int)udiff/1000,(uint32_t) latency_min/1000u,latency_avg/1000u,latency_max/1000u,skiped_avg/1000u);
+		 output.device_frames = 0;
+		 output.device_frames += pulse_get_usec_to_frames(latency_avg)+1u;
+		 //output.device_frames += device_frames;
+	      } else {
+                 LOG_WARN("PulseAudio Latency 0");
+	      }
+	      nextms = timems+DEVICE_FRAME_INTERVAL_MS;
+	   } else {
+              LOG_WARN("PulseAudio Latency failure");
+	   }
+	} else {
+	      LOG_SDEBUG("Skip latency update %u %u, %uf",nextms,timems,output.device_frames);
+	}
 }
 
 static void pulse_set_volume(struct pulse *p, unsigned left, unsigned right) {
@@ -376,6 +546,7 @@ bool test_open(const char *device, unsigned rates[], bool userdef_rates) {
 	d.sample_spec = &pulse.sample_spec;
 	d.is_default_device = strcmp(device, "default") == 0;
 	const char *sink_name = d.is_default_device ? NULL : device;
+	LOG_DEBUG("Device: %s, Sink: %s",device,sink_name);
 	pa_operation *op = pa_context_get_sink_info_by_name(pulse_connection_get_context(&pulse.conn), sink_name, pulse_sinkinfo_cb, &d);
 	if (!pulse_operation_wait(&pulse.conn, op))
 		return false;
@@ -398,40 +569,28 @@ void output_state_timer_cb(pa_mainloop_api *api, pa_time_event *e, const struct 
 	pa_context_rttime_restart(pulse_connection_get_context(&p->conn), e, pa_rtclock_now() + OUTPUT_STATE_TIMER_INTERVAL_USEC);
 }
 
-#if PULSEAUDIO_TIMING == 0
-#	define DECLARE_LATENCY(n)			(void)0
-#	define pulse_retrieve_latency(n)	true
-#	define pulse_get_latency(n)			0
-#elif PULSEAUDIO_TIMING == 2
-#	define DECLARE_LATENCY(n)			pa_usec_t n
-	static inline bool pulse_retrieve_latency(pa_usec_t *usec) {
-		return pa_stream_get_latency(pulse.stream, usec, NULL) == 0;
-	}
-#endif
 
-#if PULSEAUDIO_TIMING > 0
-static inline unsigned pulse_get_latency(pa_usec_t usec) {
-	return (unsigned)((usec * output.current_sample_rate) / PA_USEC_PER_SEC);
-}
-#endif
+
 
 static void * output_thread(void *arg) {
-	bool output_off = (output.state == OUTPUT_OFF);
 	pa_time_event *output_state_timer = NULL;
+        output_state last = output.state;
 
 	while (pulse.running) {
-		if (output_off) {
+	        if (output.state == OUTPUT_OFF) {
 			if (pulse.stream != NULL) {
 				LOG_DEBUG("destroying PulseAudio playback stream");
 				pulse_stream_destroy(&pulse);
 			}
 			
 			if (output_state_timer == NULL) {
+				LOG_DEBUG("PulseAudio output off timer");
 				output_state_timer = pa_context_rttime_new(pulse_connection_get_context(&pulse.conn),
 					pa_rtclock_now() + OUTPUT_STATE_TIMER_INTERVAL_USEC, output_state_timer_cb, &pulse);
 			}
 		} else {
 			if (output_state_timer != NULL) {
+				LOG_DEBUG("PulseAudio timer", pulse.sink_name);
 				pa_mainloop_api *api = pa_mainloop_get_api(pulse.conn.loop);
 				api->time_free(output_state_timer);
 				output_state_timer = NULL;
@@ -440,47 +599,71 @@ static void * output_thread(void *arg) {
 			if (pulse.stream == NULL) {
 				if (pulse_stream_create(&pulse)) {
 					LOG_DEBUG("PulseAudio playback stream on sink %s open", pulse.sink_name);
-
 					unsigned left, right;
+					LOG_INFO("Output Buffer %u",outputbuf->size);
 					LOCK;
+					latency_min = PULSE_BUFFER_TARGET_MS*1000u;
+					latency_max = latency_min;
+					output.device_frames = pulse_get_usec_to_frames(latency_min);
+					output.start_frames = pulse_get_usec_to_frames(latency_min);
 					left = output.gainL;
 					right = output.gainR;
+					output.updated = gettime_ms();
+					nextms = output.updated + DEVICE_FRAME_INIT_INTERRVAL_MS;
 					UNLOCK;
 					pulse_set_volume(&pulse, left, right);
+					LOG_INFO("Initial Device delay %uf %ums(%us)",output.device_frames,pulse_frames_to_usec(output.device_frames)/1000u,pulse_frames_to_usec(output.device_frames)/1000u/1000u);
 				} else {
 					if (!pulse.running)
 						break;
 					output.error_opening = true;
 				}
-			}
-
-			if (pulse.stream != NULL) {
+			} else {
 				size_t writable = pa_stream_writable_size(pulse.stream);
 				if (writable > 0) {
 
-					DECLARE_LATENCY(latency);
-					bool latency_ok = pulse_retrieve_latency(&latency);
+					//DECLARE_LATENCY(latency_usec);
+					//int neg;
+					//bool latency_ok = pulse_retrieve_latency(&latency_usec, &neg);
+					//frames_t frames_write = writable / pa_sample_size(pa_stream_get_sample_spec(pulse.stream));
+					frames_t frames_write = writable / BYTES_PER_FRAME;
+					//frames_t device_frames = pulse_get_latency_frames(latency_usec);
 
-					frames_t frame_count = writable / pa_sample_size(pa_stream_get_sample_spec(pulse.stream));
-
-					LOCK;
-
+		                        LOCK;
+/**
 					if (latency_ok) {
-						output.device_frames = pulse_get_latency(latency);
-						output.updated = gettime_ms();
-						output.frames_played_dmp = output.frames_played;
+						if ( device_frames != 0 ) {
+						   output.device_frames = device_frames;
+						   output.updated = gettime_ms();
+						   output.frames_played_dmp = output.frames_played;
+						} else {
+						   if (output.device_frames != 0) { LOG_WARN("device frames was 0 currently %u",output.device_frames); }
+						}
 					}
+**/
+					// process frames
+		                        //frames_t wrote = _output_frames(frame_write > device_frames*2 ? device_frames*2 : frame_write);
+				        output.frames_played_dmp = output.frames_played;
+					output.updated = gettime_ms();
+					pulse_device_frames(output.updated);
+		                        frames_t wrote = _output_frames(frames_write);
+		                        UNLOCK;
 
-					_output_frames(frame_count);
+			                //LOG_SDEBUG("latency:s d p w %c %s%ums%uf %u %u", buffer_state_char(), neg==1 ? "-":"+", latency_usec > 0 ? latency_usec / 1000:0, output.device_frames, output.frames_played, frames_write);
 
-					UNLOCK;
-				}
+		                        if (!wrote) {
+			                   LOG_SDEBUG("wrote 0 - sleeping");
+			                   usleep(10000);
+		                        }
+				} else {
+			               LOG_SDEBUG("writeable:no");
+				       usleep(10000);
+			        }
 			}
 		}
 
+                last = output.state;
 		pulse_connection_iterate(&pulse.conn);
-
-		output_off = (output.state == OUTPUT_OFF);
 	}
 
 	pulse_stream_destroy(&pulse);
@@ -490,15 +673,15 @@ static void * output_thread(void *arg) {
 
 static pthread_t thread;
 
-void output_init_pulse(log_level level, const char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay, unsigned idle) {
+void output_init_pulse(log_level level, const char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay, unsigned idle, unsigned rt_priority) {
 	loglevel = level;
 
 	LOG_INFO("init output");
 
 	output.format = 0;
-	output.start_frames = 0;
 	output.write_cb = &_write_frames;
 	output.rate_delay = rate_delay;
+	LOG_INFO("Output Buffer Size %u",output_buf_size);
 
 	if (!pulse_connection_init(&pulse.conn)) {
 		// In case of an error, the message is logged by the pulse_connection_init itself.
@@ -506,6 +689,11 @@ void output_init_pulse(log_level level, const char *device, unsigned output_buf_
 	}
 
 	output_init_common(level, device, output_buf_size, rates, idle);
+	if (mlockall(MCL_CURRENT | MCL_FUTURE) == -1) {
+                LOG_WARN("unable to lock memory: %s", strerror(errno));
+        } else {
+                LOG_INFO("memory locked");
+        }
 
 	// start output thread
 	pulse.running = true;
@@ -514,6 +702,15 @@ void output_init_pulse(log_level level, const char *device, unsigned output_buf_
 	pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN + OUTPUT_THREAD_STACK_SIZE);
 	pthread_create(&thread, &attr, output_thread, NULL);
 	pthread_attr_destroy(&attr);
+
+	// try to set this thread to real-time scheduler class, only works as root or if user has permission
+	struct sched_param param;
+	param.sched_priority = rt_priority;
+	if (pthread_setschedparam(thread, SCHED_FIFO, &param) != 0) {
+		LOG_WARN("unable to set output sched fifo: %s", strerror(errno));
+	} else {
+		LOG_INFO("set output sched fifo rt: %u", param.sched_priority);
+	}
 }
 
 void output_close_pulse(void) {
@@ -531,4 +728,8 @@ void output_close_pulse(void) {
 	output_close_common();
 }
 
+void output_flush_pulse(void) {
+	LOG_INFO("flush output");
+	pa_stream_flush	(pulse.stream, NULL,NULL);
+}
 #endif

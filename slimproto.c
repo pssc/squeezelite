@@ -313,7 +313,7 @@ static void process_strm(u8_t *pkt, int len) {
 			}
 			UNLOCK_O;
 			if (!interval) sendSTAT("STMp", 0);
-			LOG_DEBUG("pause interval: %u", interval);
+			LOG_DEBUG("pause interval: %ums", interval);
 		}
 		break;
 	case 'a':
@@ -323,7 +323,7 @@ static void process_strm(u8_t *pkt, int len) {
 			output.skip_frames = interval * status.current_sample_rate / 1000;
 			output.state = OUTPUT_SKIP_FRAMES;				
 			UNLOCK_O;
-			LOG_DEBUG("skip ahead interval: %u", interval);
+			LOG_DEBUG("skip ahead interval: %ums", interval);
 		}
 		break;
 	case 'u':
@@ -334,7 +334,7 @@ static void process_strm(u8_t *pkt, int len) {
 			output.start_at = jiffies;
 			UNLOCK_O;
 
-			LOG_DEBUG("unpause at: %u now: %u", jiffies, gettime_ms());
+			LOG_DEBUG("unpause at: %u now: %ums", jiffies, gettime_ms());
 			sendSTAT("STMr", 0);
 		}
 		break;

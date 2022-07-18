@@ -98,7 +98,7 @@ static void usage(const char *argv0) {
 		   "  -n <name>\t\tSet the player name\n"
 		   "  -N <filename>\t\tStore player name in filename to allow server defined name changes to be shared between servers (not supported with -n)\n"
 		   "  -W\t\t\tRead wave and aiff format from header, ignore server parameters\n"
-#if ALSA
+#if ALSA || PULSEAUDIO
 		   "  -p <priority>\t\tSet real time priority of output thread (1-99)\n"
 #endif
 #if LINUX || FREEBSD || SUN
@@ -304,8 +304,10 @@ int main(int argc, char **argv) {
 	char *pidfile = NULL;
 	FILE *pidfp = NULL;
 #endif
-#if ALSA
+#if ALSA || PULSEAUDIO
 	unsigned rt_priority = OUTPUT_RT_PRIORITY;
+#endif
+#if ALSA
 	char *mixer_device = output_device;
 	char *output_mixer = NULL;
 	bool output_mixer_unmute = false;
@@ -523,7 +525,7 @@ int main(int argc, char **argv) {
 		case 'W':
 			pcm_check_header = true;
 			break;
-#if ALSA
+#if ALSA || PULSEAUDUIO
 		case 'p':
 			rt_priority = atoi(optarg);
 			if (rt_priority > 99 || rt_priority < 1) {
@@ -768,7 +770,7 @@ int main(int argc, char **argv) {
 		output_init_pa(log_output, output_device, output_buf_size, output_params, rates, rate_delay, idle);
 #endif
 #if PULSEAUDIO
-		output_init_pulse(log_output, output_device, output_buf_size, output_params, rates, rate_delay, idle);
+		output_init_pulse(log_output, output_device, output_buf_size, output_params, rates, rate_delay, idle, rt_priority);
 #endif
 	}
 

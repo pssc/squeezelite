@@ -447,6 +447,9 @@ void output_flush(void) {
 			output.current_sample_rate = output.default_sample_rate;
 		}
 		output.delay_active = false;
+#if PULSEAUDIO
+        output_flush_pulse();
+#endif
 	}
 	output.frames_played = 0;
 	UNLOCK;

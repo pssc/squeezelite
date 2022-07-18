@@ -260,6 +260,11 @@
 #define ALSA_PERIOD_COUNT 4
 #define OUTPUT_RT_PRIORITY 45
 #endif
+#if PULSEAUDIO
+// PULSE Audio server defaults to 5 or lower so 3 for a client.
+#define OUTPUT_RT_PRIORITY 45
+#endif
+
 
 #define SL_LITTLE_ENDIAN (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
 
@@ -710,8 +715,9 @@ void list_devices(void);
 void set_volume(unsigned left, unsigned right);
 void set_sample_rate(uint32_t sample_rate);
 bool test_open(const char *device, unsigned rates[], bool userdef_rates);
-void output_init_pulse(log_level level, const char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay, unsigned idle);
+void output_init_pulse(log_level level, const char *device, unsigned output_buf_size, char *params, unsigned rates[], unsigned rate_delay, unsigned idle, unsigned rt_priority);
 void output_close_pulse(void);
+void output_flush_pulse(void);
 #endif
 
 // output_stdout.c
